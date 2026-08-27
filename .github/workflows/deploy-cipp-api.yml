@@ -120,7 +120,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          endpoint="https://${{ vars.AZURE_FUNCTIONAPP_NAME }}.azurewebsites.net/api/PublicPing"
+          public_base_url="${{ vars.CIPP_PUBLIC_BASE_URL }}"
+          case "$public_base_url" in
+            https://*) ;;
+            *)
+              echo 'CIPP_PUBLIC_BASE_URL must be an HTTPS URL.' >&2
+              exit 1
+              ;;
+          esac
+          endpoint="${public_base_url%/}/api/PublicPing"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
 
