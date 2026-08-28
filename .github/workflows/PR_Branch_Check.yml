@@ -23,6 +23,7 @@ jobs:
         # Must be a fork AND (source is main/master OR target is main/master)
         if: |
           github.event.pull_request.head.repo.fork == true &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
           ((github.event.pull_request.head.ref == 'main' || github.event.pull_request.head.ref == 'master') ||
           (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'master'))
         uses: actions/github-script@v9
