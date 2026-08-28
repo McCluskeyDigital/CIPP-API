@@ -1,0 +1,145 @@
+name: Deploy verified CIPP API release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - version_latest.txt
+
+permissions:
+  contents: read
+  id-token: write
+
+# Production deployments must queue rather than cancel an in-flight update.
+concurrency:
+  group: cipp-api-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Verify and deploy official CIPP API release
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout deployment revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read expected release version
+        id: expected_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < version_latest.txt)"
+          test -n "$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download official release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output cipp-api-latest.zip \
+            https://cippreleases.blob.core.windows.net/cipp-api/latest.zip
+
+      - name: Verify package provenance and integrity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -tq cipp-api-latest.zip
+          test "$(unzip -Z1 cipp-api-latest.zip | grep -cx 'host.json')" -eq 1
+          test "$(unzip -Z1 cipp-api-latest.zip | grep -cx 'version.json')" -eq 1
+
+          package_version="$(unzip -p cipp-api-latest.zip version.json | jq -er '.version')"
+          test "$package_version" = "${{ steps.expected_version.outputs.version }}"
+
+          package_commit="$(unzip -p cipp-api-latest.zip version.json | jq -er '.commit')"
+          case "$package_commit" in
+            *[!0-9a-f]* | '')
+              echo 'Release package contains an invalid commit identifier.' >&2
+              exit 1
+              ;;
+          esac
+
+          resolved_commit="$(git rev-parse --verify "${package_commit}^{commit}")"
+          git merge-base --is-ancestor "$resolved_commit" HEAD
+
+          sha256="$(sha256sum cipp-api-latest.zip | awk '{print $1}')"
+          printf 'sha256=%s\n' "$sha256" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$resolved_commit" >> "$GITHUB_OUTPUT"
+
+          {
+            echo '### Verified CIPP API package'
+            echo
+            echo "- Version: \`$package_version\`"
+            echo "- Commit: \`$resolved_commit\` (ancestor of deployment revision)"
+            echo "- SHA-256: \`$sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain verified deployment package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cipp-api-${{ steps.expected_version.outputs.version }}-${{ steps.package.outputs.sha256 }}
+          path: cipp-api-latest.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy verified package
+        uses: Azure/functions-action@c5060b3b8bb1ebbcb531abd00c822ecbaa8ea656 # v1.5.3
+        with:
+          app-name: ${{ vars.AZURE_FUNCTIONAPP_NAME }}
+          package: cipp-api-latest.zip
+
+      - name: Verify Function App state
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(az functionapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_FUNCTIONAPP_NAME }}" \
+            --query state --output tsv)"
+          test "$state" = 'Running'
+          echo 'Function App state: Running.'
+
+      - name: Verify PublicPing
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_base_url="${{ vars.CIPP_PUBLIC_BASE_URL }}"
+          case "$public_base_url" in
+            https://*) ;;
+            *)
+              echo 'CIPP_PUBLIC_BASE_URL must be an HTTPS URL.' >&2
+              exit 1
+              ;;
+          esac
+          endpoint="${public_base_url%/}/api/PublicPing"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+
+          for attempt in $(seq 1 12); do
+            status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' "$endpoint" || true)"
+            if test "$status" = '200' && jq -e '.Results.Message == "Pong"' "$response_file" >/dev/null; then
+              echo 'PublicPing returned Pong.'
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo 'PublicPing did not return the expected successful response.' >&2
+          exit 1
